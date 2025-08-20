@@ -67,45 +67,42 @@ def unpad_frame(img, pad=16) -> np.ndarray:
 
 def overlay_counts(frame, per_frame_count, unique_count) -> np.ndarray:
     """
-    Overlay current and unique counts on a video frame.
+    Overlay current and unique counts on a video frame in a compact style.
 
     Parameters
     ----------
-    frame : numpy.ndarray
+    frame : np.ndarray
         The image on which to overlay the counts.
     per_frame_count : int
-        The count of objects detected in the current frame.
+        Count of objects in the current frame.
     unique_count : int
-        The total unique count of objects detected so far.
+        Total unique objects detected so far.
 
     Returns
     -------
-    numpy.ndarray
-        The frame with the counts overlaid.
+    np.ndarray
+        Frame with counts overlaid.
     """
     h, w, _ = frame.shape
-    x1, y1, x2, y2 = 10, h - 70, 230, h - 10
-    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 0), -1)
-    cv2.putText(
-        frame,
-        f"Now: {per_frame_count}",
-        (x1 + 10, y1 + 25),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (255, 255, 255),
-        2,
-    )
-    cv2.putText(
-        frame,
-        f"Unique: {unique_count}",
-        (x1 + 10, y1 + 50),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (255, 255, 255),
-        2,
-    )
-    return frame
 
+    padding = 8
+    rect_w, rect_h = 140, 50
+    x1, y1 = padding, h - rect_h - padding
+    x2, y2 = x1 + rect_w, y1 + rect_h
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 0, 0), -1)
+    alpha = 0.6
+    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale, thickness = 0.5, 1
+    color = (255, 255, 255)
+
+    cv2.putText(frame, f"Now: {per_frame_count}", (x1 + 10, y1 + 20), font, scale, color, thickness)
+    #cv2.putText(frame, f"Unique: {unique_count}", (x1 + 10, y1 + 40), font, scale, color, thickness)
+
+    return frame
 
 def draw_transparent_box(frame, box, color=(0, 255, 0), alpha=0.1, thickness=2)-> np.ndarray:
     """
@@ -130,11 +127,8 @@ def draw_transparent_box(frame, box, color=(0, 255, 0), alpha=0.1, thickness=2)-
     """
     overlay = frame.copy()
     x1, y1, x2, y2 = box
-    # Filled rectangle with transparency
     cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
-    # Blend overlay with original frame
     cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
-    # Optional: Draw border
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
     return frame
 
@@ -168,13 +162,39 @@ def get_track_color(track_id: int) -> tuple[int, int, int]:
         )
     return track_colors[track_id]
 
+def shrink_box(box, shrink_factor=0.8):
+    """
+    Shrink a bounding box by a factor, keeping the center the same.
+
+    Parameters
+    ----------
+    box : list or tuple
+        [x1, y1, x2, y2]
+    shrink_factor : float
+        Factor to reduce width and height (0 < factor <= 1)
+
+    Returns
+    -------
+    list
+        Shrunk box coordinates [x1, y1, x2, y2]
+    """
+    x1, y1, x2, y2 = box
+    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+    w, h = (x2 - x1) * shrink_factor, (y2 - y1) * shrink_factor
+    x1_new = cx - w / 2
+    y1_new = cy - h / 2
+    x2_new = cx + w / 2
+    y2_new = cy + h / 2
+    return [x1_new, y1_new, x2_new, y2_new]
+
+
 def process_frame(
     frame,
     model,
     tracker_type: str = "deepsort",
     tracker=None,
     unique_ids: set = None,
-    conf: float = 0.20,
+    conf: float = 0.50,
     iou: float = 0.50,
     padding: int = 16,
 ) -> tuple:
@@ -239,10 +259,14 @@ def process_frame(
         results = model(frame_in, conf=conf, iou=iou, classes=[0])[0]
         boxes = results.boxes.xyxy.cpu().numpy()  # Nx4
         scores = results.boxes.conf.cpu().numpy()  # N
+
         detections = [
-            (box.tolist(), float(score), 0) for box, score in zip(boxes, scores)
+             (shrink_box(box.tolist()), float(score), 0) for box, score in zip(boxes, scores)
         ]
+
         tracks = tracker.update_tracks(detections, frame=frame)
+
+
         annotated = frame_in.copy()
         for track in tracks:
             if not track.is_confirmed():
@@ -252,7 +276,8 @@ def process_frame(
             if track_frames[track_id] < 3:
                 continue
             unique_ids.add(track_id)
-            x1, y1, x2, y2 = map(int, track.to_ltrb())
+            #x1, y1, x2, y2 = map(int, track.to_ltrb())
+            x1, y1, x2, y2 = smooth_track(track_id, track.to_ltrb())
             annotated = draw_transparent_box(
                 annotated,
                 (x1, y1, x2, y2),
@@ -300,15 +325,24 @@ def smooth_track(track_id: int, box: tuple, history_len: int = 5) -> tuple:
         track_history[track_id] = []
     track_history[track_id].append(box)
 
-    # Keep only the last `history_len` boxes
     if len(track_history[track_id]) > history_len:
         track_history[track_id].pop(0)
 
-    # Compute average of the last boxes
+    # Average coordinates
     x1 = int(sum(b[0] for b in track_history[track_id]) / len(track_history[track_id]))
     y1 = int(sum(b[1] for b in track_history[track_id]) / len(track_history[track_id]))
     x2 = int(sum(b[2] for b in track_history[track_id]) / len(track_history[track_id]))
     y2 = int(sum(b[3] for b in track_history[track_id]) / len(track_history[track_id]))
+
+    # Clamp box size relative to previous
+    if len(track_history[track_id]) > 1:
+        prev_box = track_history[track_id][-2]
+        max_width = int((prev_box[2] - prev_box[0]) * 2)
+        max_height = int((prev_box[3] - prev_box[1]) * 2)
+        width = min(x2 - x1, max_width)
+        height = min(y2 - y1, max_height)
+        x2 = x1 + width
+        y2 = y1 + height
 
     return (x1, y1, x2, y2)
 
@@ -318,8 +352,8 @@ def process_video(
     video_path: str,
     output_path: str,
     model,
-    tracker_type: str = "deepsort",
-    conf: float = 0.2,
+    tracker_type: str = "bytetrack",
+    conf: float = 0.5,
     iou: float = 0.5
 ) -> set:
     """
